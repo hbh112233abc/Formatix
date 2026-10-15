@@ -65,6 +65,63 @@ from converter import (
     convert_one,
 )
 
+# ── 崩溃诊断：把未捕获异常与原生崩溃(段错误)写入日志文件 ──────────────────
+import tempfile as _tempfile
+import traceback as _traceback
+import faulthandler as _faulthandler
+
+
+def _install_crash_logger():
+    """把未捕获异常、线程异常以及原生崩溃(段错误)全部写入临时日志文件，
+    并在 Tk 根已建立时弹窗提示，便于打包后「闪退且无报错」时定位问题。"""
+    _log_path = os.path.join(_tempfile.gettempdir(), "formatix_crash.log")
+    try:
+        _log_fh = open(_log_path, "a", encoding="utf-8")
+    except Exception:
+        return
+
+    # faulthandler 能捕获原生段错误并dump堆栈到文件，进程崩溃也不会丢失
+    try:
+        _faulthandler.enable(file=_log_fh)
+    except Exception:
+        pass
+
+    def _write(tag, text):
+        try:
+            _ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            _log_fh.write(f"\n[{_ts}] {tag}\n{text}\n")
+            _log_fh.flush()
+        except Exception:
+            pass
+
+    def _popup(text):
+        try:
+            _root = tk._default_root
+            if _root is not None:
+                messagebox.showerror(
+                    APP_NAME,
+                    "程序发生异常，详细日志已写入：\n" + _log_path + "\n\n" + text)
+        except Exception:
+            pass
+
+    def _excepthook(etype, exc, tb):
+        _text = "".join(_traceback.format_exception(etype, exc, tb))
+        _write("UNCAUGHT EXCEPTION (主线程)", _text)
+        _popup(_text)
+
+    def _thread_excepthook(args):
+        _text = "".join(_traceback.format_exception(
+            args.exc_type, args.exc_value, args.exc_traceback))
+        _write(f"UNCAUGHT EXCEPTION (线程 {getattr(args, 'thread', None)})", _text)
+        _popup(_text)
+
+    sys.excepthook = _excepthook
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = _thread_excepthook
+
+
+_install_crash_logger()
+
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".formatix_image_converter_settings.json")
 
 
@@ -357,6 +414,59 @@ class SegmentedToggle(tk.Frame):
         self._redraw()
 
 
+class CheckToggle(tk.Frame):
+    """紧凑勾选框：勾选框用 Canvas 手绘，右侧跟一段文字标签。
+
+    和 SegmentedToggle 一样不自持状态：由传入的 tk.BooleanVar 驱动，通过
+    trace 订阅变化并重绘；点击时只翻转变量再回调 command，实际值始终由
+    变量持有 —— 这样「画出来的状态」和「设置里保存的状态」不会走偏。
+    """
+
+    def __init__(self, parent, text, variable, command=None,
+                 box=15, font=("Segoe UI", 9)):
+        super().__init__(parent, bg=BG2)
+        self._variable = variable
+        self._command  = command
+        self._box      = box
+        self._font     = font
+
+        self.canvas = tk.Canvas(self, width=box, height=box, bg=BG2, bd=0,
+                                highlightthickness=0, cursor="hand2")
+        self.canvas.pack(side="left")
+
+        self.label = tk.Label(self, text=text, font=font, bg=BG2, fg=FG2,
+                              cursor="hand2")
+        self.label.pack(side="left", padx=(6, 0))
+
+        # 整个区域都可点击：勾选框、文字标签以及空白处
+        for w in (self, self.canvas, self.label):
+            w.bind("<Button-1>", self._on_click)
+
+        self._variable.trace_add("write", lambda *a: self._redraw())
+        self._redraw()
+
+    def _redraw(self):
+        c = self.canvas
+        b = self._box
+        c.delete("all")
+        checked = bool(self._variable.get())
+        c.create_rectangle(1, 1, b - 1, b - 1,
+                           outline=ACCENT if checked else FG3,
+                           fill=ACCENT if checked else BG2, width=1)
+        if checked:
+            c.create_line(3, 8, 6, 11, fill="#fff", width=2)
+            c.create_line(6, 11, 12, 4, fill="#fff", width=2)
+
+    def _on_click(self, event=None):
+        self._variable.set(not self._variable.get())
+        if self._command:
+            self._command()
+
+    def set_label(self, text):
+        """切换界面语言时刷新文字标签。"""
+        self.label.config(text=text)
+
+
 # ── ГЛАВНОЕ ОКНО ──────────────────────────────────────────────────────────────
 BaseClass = TkinterDnD.Tk if HAS_DND else tk.Tk
 
@@ -439,6 +549,11 @@ class App(BaseClass):
         self._filename_preset = tk.StringVar(value="original")
         self._filename_tokens = []
 
+        # 「保留元数据」：勾选后把源文件内嵌元数据（EXIF/XMP/ICC 等）复制进
+        # 结果文件。默认关闭 —— 不勾选时行为与加这个功能之前完全一致。
+        self._keep_metadata = tk.BooleanVar(value=False)
+        self._keep_metadata.trace_add("write", lambda *a: self._save_settings())
+
         self._loading = True  # блокирует _save_settings во время инициализации
         self._style_ttk()
         self._build()
@@ -483,6 +598,8 @@ class App(BaseClass):
                     t for t in saved_fn_tokens
                     if isinstance(t, dict) and t.get("type") in ("name", "index", "date", "text")
                 ]
+            # 恢复「保留元数据」勾选状态
+            self._keep_metadata.set(bool(self._settings.get("keep_metadata", False)))
 
         self._loading = False  # восстановление завершено, теперь сохранять можно
 
@@ -589,6 +706,10 @@ class App(BaseClass):
         except AttributeError:
             pass
         try:
+            self._settings["keep_metadata"] = self._keep_metadata.get()
+        except AttributeError:
+            pass
+        try:
             out_dir_val = self._out_dir.get()
             # Сохраняем только реальный путь, не плейсхолдер
             if out_dir_val and os.path.isdir(out_dir_val):
@@ -614,6 +735,7 @@ class App(BaseClass):
             to_write.pop("out_dir", None)
             to_write.pop("filename_preset", None)
             to_write.pop("filename_tokens", None)
+            to_write.pop("keep_metadata", None)
         save_settings(to_write)
 
     # ── проверка обновлений ──────────────────────────────────────────────────
@@ -856,6 +978,27 @@ class App(BaseClass):
         # Изначально неактивна
         self._open_dir_btn.configure(fg=FG3)
 
+        # ПРОГРЕСС — отдельная строка сразу под папкой сохранения: ярлык,
+        # растягивающийся прогрессбар и строка статуса справа от него.
+        progress_row = tk.Frame(bot, bg=BG2)
+        progress_row.pack(fill="x", pady=(0, 10))
+        self._progress_lbl = tk.Label(progress_row, text=self.t("progress_lbl"),
+                                      font=("Segoe UI", 10, "bold"), bg=BG2, fg=FG2)
+        self._progress_lbl.pack(side="left", padx=(0, 8))
+        self._prog = ttk.Progressbar(progress_row, style="P.Horizontal.TProgressbar",
+                                     mode="determinate")
+        self._prog.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self._status     = tk.StringVar(value="")
+        self._status_err = tk.StringVar(value="")
+        status_frame = tk.Frame(progress_row, bg=BG2)
+        status_frame.pack(side="left", fill="x", expand=True)
+        self._status_lbl = tk.Label(status_frame, textvariable=self._status,
+                                    font=("Segoe UI", 10), bg=BG2, fg=FG2, anchor="w")
+        self._status_lbl.pack(side="left")
+        self._status_err_lbl = tk.Label(status_frame, textvariable=self._status_err,
+                                        font=("Segoe UI", 10), bg=BG2, fg=ACCENT2, anchor="w")
+        self._status_err_lbl.pack(side="left", padx=(6, 0))
+
         # Вся нижняя панель управления — один горизонтальный ряд через pack
         # Каждый блок: лейбл сверху + виджет снизу. Выравнивание — anchor="n"
         ctrl_row = tk.Frame(bot, bg=BG2)
@@ -987,44 +1130,29 @@ class App(BaseClass):
         self._on_resize_mode_changed()
         self._refresh_quality_mode_ui()
 
-        # ПРОГРЕСС — блок растягивается, прогрессбар и виджет-фрейм тоже
-        _pf_blk, self._progress_lbl, _pf_wf = _ctrl_block(ctrl_row, self.t("progress_lbl"))
-        _pf_blk.pack_configure(side="left", fill="x", expand=True, padx=(0, 16), anchor="n")
-        _pf_wf.pack_configure(fill="x")   # виджет-фрейм растягивается вместе с блоком
-        self._prog = ttk.Progressbar(_pf_wf, style="P.Horizontal.TProgressbar", mode="determinate")
-        self._prog.pack(fill="x")
-        self._status     = tk.StringVar(value="")
-        self._status_err = tk.StringVar(value="")
-        status_row = tk.Frame(_pf_wf, bg=BG2)
-        status_row.pack(anchor="w", fill="x", pady=(2, 0))
-        self._status_lbl = tk.Label(status_row, textvariable=self._status,
-                                    font=("Segoe UI", 10), bg=BG2, fg=FG2, anchor="w")
-        self._status_lbl.pack(side="left")
-        self._status_err_lbl = tk.Label(status_row, textvariable=self._status_err,
-                                        font=("Segoe UI", 10), bg=BG2, fg=ACCENT2, anchor="w")
-        self._status_err_lbl.pack(side="left", padx=(6, 0))
-
-        # КНОПКА КОНВЕРТАЦИИ — на уровне лейблов (верхний ряд блока)
+        # КНОПКА КОНВЕРТАЦИИ — прижата к правому нижнему краю панели через
+        # side="right", чтобы после удаления блока «размер файлов» справа не
+        # оставалось пустого места, а кнопка всегда стояла в правом углу.
         _cbtn_blk = tk.Frame(ctrl_row, bg=BG2)
-        _cbtn_blk.pack(side="left", anchor="n", padx=(0, 16))
+        _cbtn_blk.pack(side="right", anchor="n", padx=(0, 0))
         self._cbtn = self._btn(_cbtn_blk, self.t("convert_btn"), self._start, accent=True, big=True)
         self._cbtn.config(width=16)
         self._cbtn.pack(anchor="w", pady=(7, 0))
         self._cbtn.bind("<Enter>", self._on_cbtn_enter)
         self._cbtn.bind("<Leave>", self._on_cbtn_leave)
 
-        # РАЗМЕР ФАЙЛОВ
-        _sz_blk2, self._filesize_lbl, _sz_wf2 = _ctrl_block(ctrl_row, self.t("filesize_lbl"))
-        _sz_blk2.pack_configure(padx=0)
-        self._stats_frame = _sz_wf2
-        self._lbl_size_src = tk.Label(self._stats_frame,
-                                      text=f"{self.t('was')}  0.0 KB",
-                                      font=("Consolas", 10), bg=BG2, fg=FG2, anchor="w")
-        self._lbl_size_src.pack(anchor="w")
-        self._lbl_size_dst = tk.Label(self._stats_frame,
-                                      text=f"{self.t('became')} 0.0 KB",
-                                      font=("Consolas", 10, "bold"), bg=BG2, fg=FG3, anchor="w")
-        self._lbl_size_dst.pack(anchor="w")
+        # 保留元数据 —— 紧贴转换按钮左侧（同样 side="right"，排在 кнопкой левее）：
+        # 无标题块，顶部留一个与左侧带标题块等高的空白标签，保证勾选框与按钮同基线。
+        _meta_blk = tk.Frame(ctrl_row, bg=BG2)
+        _meta_blk.pack(side="right", anchor="n", padx=(0, 16))
+        tk.Label(_meta_blk, text=" ", font=("Segoe UI", 10, "bold"),
+                 bg=BG2, fg=BG2).pack(anchor="w")
+        _meta_wf = tk.Frame(_meta_blk, bg=BG2)
+        _meta_wf.pack(anchor="w", pady=(6, 0))
+        self._meta_chk = CheckToggle(_meta_wf, self.t("keep_metadata"),
+                                     self._keep_metadata,
+                                     command=self._save_settings)
+        self._meta_chk.pack(anchor="w")
 
     def _make_tree(self, parent, title, col, is_result=False):
         """Создаёт панель с деревом (список файлов или результатов)."""
@@ -1705,13 +1833,6 @@ class App(BaseClass):
 
         if not self._running:
             self._status.set(self.t("files_count").format(n=n))
-        self._lbl_size_src.config(
-            text=f"{self.t('was')}  {format_size(self._total_src_bytes)}", fg=FG)
-        if self._total_dst_bytes > 0:
-            self._lbl_size_dst.config(
-                text=f"{self.t('became')} {format_size(self._total_dst_bytes)}", fg=GREEN)
-        else:
-            self._lbl_size_dst.config(text=f"{self.t('became')} 0.0 KB", fg=FG3)
 
         # Если в списке есть SVG-файлы БЕЗ размера — автоматически переключаем на Custom
         if self._has_svg_without_size():
@@ -1780,8 +1901,8 @@ class App(BaseClass):
         self._qmode_toggle.set_labels([
             ("percent", self.t("qmode_percent")), ("size", self.t("qmode_size"))])
         self._resize_lbl.config(text=self.t("resize_lbl"))
+        self._meta_chk.set_label(self.t("keep_metadata"))
         self._progress_lbl.config(text=self.t("progress_lbl"))
-        self._filesize_lbl.config(text=self.t("filesize_lbl"))
         self._settings_btn.config(text=self.t("settings_title"))
 
         # Сохраняем текущий режим по языконезависимому ключу
@@ -2037,8 +2158,12 @@ class App(BaseClass):
         else:
             q_part = f"q:{self._qual.get()}"
         fn_part = f"fn:{filename_preset}:{filename_tokens}"
+        # 「保留元数据」必须计入缓存键：否则切换勾选后会把没有元数据的
+        # 旧缓存结果当成命中直接复用
+        meta_part = f"meta:{1 if self._keep_metadata.get() else 0}"
         current_config_str = (f"fmt:{fmt_now}|{q_part}|dir:{out_dir}"
-                              f"|mode:{mode_key}|w:{target_w}|h:{target_h}|{fn_part}")
+                              f"|mode:{mode_key}|w:{target_w}|h:{target_h}"
+                              f"|{fn_part}|{meta_part}")
 
         # Проверяем конфликты по «чистому» имени (без суффикса _1, _2 и т.д.)
         # _generate_unique_filename здесь использовать нельзя — она сама
@@ -2074,7 +2199,6 @@ class App(BaseClass):
         self._total_dst_bytes = 0
         for item in self._tv_dst.get_children():
             self._tv_dst.delete(item)
-        self._lbl_size_dst.config(text=f"{self.t('became')} ...", fg=ACCENT)
         self._status_lbl.config(fg=FG2)
         self._status_err.set("")
         self._open_dir_btn.config(fg=FG3)
@@ -2103,7 +2227,8 @@ class App(BaseClass):
                   mode_key, target_w, target_h,
                   self._overwrite_confirmed, batch_id,
                   quality_mode, target_bytes,
-                  filename_preset, filename_tokens),
+                  filename_preset, filename_tokens,
+                  self._keep_metadata.get()),
             daemon=True).start()
 
     # ── очередь событий GUI ───────────────────────────────────────────────────
@@ -2136,9 +2261,6 @@ class App(BaseClass):
                         display_size,
                     ), tags=(tag,))
                     self._results.append((task["out_path"], task["success"]))
-                    self._total_dst_bytes += task["size_bytes"]
-                    self._lbl_size_dst.config(
-                        text=f"{self.t('became')} {format_size(self._total_dst_bytes)}", fg=GREEN)
 
                 elif action == "update_src_res":
                     # Обновляем разрешение в левой таблице после фоновой загрузки
@@ -2181,7 +2303,8 @@ class App(BaseClass):
     def _convert_worker(self, files_snapshot, out_dir, fmt, quality, mode_key,
                         target_w, target_h, allow_overwrite=False, batch_id=0,
                         quality_mode="percent", target_bytes=None,
-                        filename_preset="original", filename_tokens=None):
+                        filename_preset="original", filename_tokens=None,
+                        keep_metadata=False):
         """Фоновый рабочий поток: конвертирует все файлы параллельно.
 
         batch_id штампуется на каждое сообщение в self._gui_queue — это
@@ -2208,8 +2331,11 @@ class App(BaseClass):
         else:
             q_part = f"q:{quality}"
         fn_part = f"fn:{filename_preset}:{filename_tokens}"
+        # 与 _start() 里的缓存键逐字一致（含「保留元数据」开关）
+        meta_part = f"meta:{1 if keep_metadata else 0}"
         current_config_str = (f"fmt:{fmt}|{q_part}|dir:{out_dir}"
-                              f"|mode:{mode_key}|w:{target_w}|h:{target_h}|{fn_part}")
+                              f"|mode:{mode_key}|w:{target_w}|h:{target_h}"
+                              f"|{fn_part}|{meta_part}")
         workers = min(os.cpu_count() or 4, 8)
 
         # Предварительное выделение уникальных имён на основе снимка списка.
@@ -2232,7 +2358,7 @@ class App(BaseClass):
                 out_name = allocated_names[path]
                 f = pool.submit(convert_one, path, out_dir, fmt, out_name, quality,
                                 mode_key, target_w, target_h, current_config_str, resize_key,
-                                quality_mode, target_bytes,
+                                quality_mode, target_bytes, keep_metadata,
                                 cache=self._converted_cache, lock=self._data_lock)
                 futures[f] = path
 

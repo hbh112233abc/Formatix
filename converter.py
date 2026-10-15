@@ -37,6 +37,7 @@ import re
 import datetime
 import contextlib
 from PIL import Image, ImageCms
+from PIL.PngImagePlugin import PngInfo
 
 # ── доступность опциональных форматов ──────────────────────────────────────────
 HEIF_AVAILABLE = False
@@ -294,6 +295,166 @@ def generate_unique_filename(out_dir, base_name, ext,
         counter += 1
 
 
+# ── метаданные ────────────────────────────────────────────────────────────────
+
+# 各输出格式实际能存哪些元数据块。BMP/ICO 完全没有元数据槽位，
+# 索性一个键都不传，避免用无关键污染保存参数。
+_METADATA_SUPPORT = {
+    "JPEG": {"exif", "icc", "xmp", "comment"},
+    "WEBP": {"exif", "icc", "xmp"},
+    "PNG":  {"exif", "icc", "xmp", "text"},
+    "AVIF": {"exif", "icc", "xmp"},
+    "HEIF": {"exif", "icc", "xmp"},
+    "TIFF": {"exif", "icc", "xmp"},
+    "BMP":  set(),
+    "ICO":  set(),
+}
+
+# Pillow 自己填充的结构化信息键（ICC/EXIF/透明度/DPI 等），不是 PNG 文本块，
+# 不能塞进 PngInfo，否则会被当成普通文本写进结果文件。
+_PNG_SYSTEM_INFO_KEYS = {
+    "icc_profile", "exif", "xmp", "transparency", "gamma", "dpi", "dpi_info",
+    "aspect", "chromaticity", "physical", "srgb", "interlace", "bbox",
+    "background", "duration", "loop", "timestamp", "compression", "progressive",
+    "quality", "bits", "planes", "orientation", "photoshop", "version",
+}
+
+
+def extract_source_metadata(img, path):
+    """抓取源文件内嵌元数据的快照（选项「保留元数据」开启时使用）。
+
+    必须在 CMYK 转换、ICC 转换、resize 之前调用：这三个操作都会返回新的
+    Image 对象，其 .info 为空，等它们执行完再取元数据必然已经丢失。
+    """
+    meta = {"exif": None, "icc": None, "xmp": None, "png_text": None,
+            "comment": None}
+    ext = os.path.splitext(path)[1].lower()
+
+    # EXIF：优先取结构化对象（含 GPS/Exif 子 IFD），失败时回退到原始字节
+    try:
+        exif_obj = img.getexif()
+        if exif_obj:
+            meta["exif"] = exif_obj.tobytes()
+    except Exception:
+        pass
+    if not meta["exif"]:
+        raw_exif = img.info.get("exif")
+        if raw_exif:
+            meta["exif"] = raw_exif
+
+    try:
+        meta["icc"] = img.info.get("icc_profile")
+    except Exception:
+        pass
+
+    try:
+        xmp = img.info.get("xmp")
+        if isinstance(xmp, str):
+            xmp = xmp.encode("utf-8")
+        meta["xmp"] = xmp or None
+    except Exception:
+        pass
+
+    # JPEG 注释（相机/编辑器写入的 COM 段）
+    if ext in (".jpg", ".jpeg"):
+        try:
+            comment = img.info.get("comment")
+            if isinstance(comment, str):
+                comment = comment.encode("utf-8", errors="replace")
+            meta["comment"] = comment or None
+        except Exception:
+            pass
+
+    # PNG 文本块（tEXt/iTXt/zTXt）：Pillow 把它们展开成 img.info 的字符串键
+    try:
+        texts = {k: v for k, v in img.info.items()
+                 if isinstance(v, str) and v and k not in _PNG_SYSTEM_INFO_KEYS}
+        meta["png_text"] = texts or None
+    except Exception:
+        pass
+
+    return meta
+
+
+def fix_exif_dimensions(exif_bytes, size):
+    """修正 resize 后过期的 EXIF 尺寸字段，并丢弃源图缩略图。
+
+    缩放后 PixelXDimension/PixelYDimension (0xA002/0xA003) 仍指向源图尺寸，
+    看图软件会显示错误分辨率；IFD1 里的源图缩略图同理，而且会白占几 KB～
+    几十 KB，直接影响「目标文件大小」模式的精度。
+    """
+    if not exif_bytes:
+        return exif_bytes
+    try:
+        exif = Image.Exif()
+        exif.load(exif_bytes)
+        w, h = int(size[0]), int(size[1])
+
+        # IFD0 与 Exif 子 IFD 里都可能各存一份尺寸
+        if 0xA002 in exif:
+            exif[0xA002] = w
+        if 0xA003 in exif:
+            exif[0xA003] = h
+        try:
+            # 源图没有 Exif 子 IFD 时不去碰它 —— get_ifd() 会凭空创建一个空的，
+            # 结果文件里就多出一个没有条目的 0x8769 指针。
+            if 0x8769 in getattr(exif, "_ifds", {}) or 0x8769 in exif:
+                sub = exif.get_ifd(0x8769)
+                if 0xA002 in sub:
+                    sub[0xA002] = w
+                if 0xA003 in sub:
+                    sub[0xA003] = h
+        except Exception:
+            pass
+
+        # IFD1（缩略图）：整块清空。这里直接读 _ifds 而不是调用 get_ifd()，
+        # 因为 get_ifd() 内部用 setdefault，会在原本没有 IFD1 时凭空建一个空的。
+        try:
+            thumb = getattr(exif, "_ifds", {}).get(0x10000)
+            if thumb:
+                for tag in list(thumb.keys()):
+                    del thumb[tag]
+        except Exception:
+            pass
+
+        return exif.tobytes()
+    except Exception:
+        return exif_bytes
+
+
+def build_metadata_kwargs(fmt, meta, size):
+    """按目标格式白名单生成 Image.save() 的元数据关键字参数。
+
+    格式不支持的块直接省略（而不是无脑透传 img.info），这样既能避免
+    Pillow 抛错，也不会把无关键塞进编码器参数里。
+    """
+    if not meta:
+        return {}
+    supported = _METADATA_SUPPORT.get(fmt, set())
+    if not supported:
+        return {}
+
+    kw = {}
+    exif = meta.get("exif")
+    if exif and "exif" in supported:
+        kw["exif"] = fix_exif_dimensions(exif, size)
+    if meta.get("icc") and "icc" in supported:
+        kw["icc_profile"] = meta["icc"]
+    if meta.get("xmp") and "xmp" in supported:
+        kw["xmp"] = meta["xmp"]
+    if meta.get("comment") and "comment" in supported:
+        kw["comment"] = meta["comment"]
+    if meta.get("png_text") and "text" in supported:
+        try:
+            pnginfo = PngInfo()
+            for key, val in meta["png_text"].items():
+                pnginfo.add_text(key, val)
+            kw["pnginfo"] = pnginfo
+        except Exception:
+            pass
+    return kw
+
+
 # ── конвертация ──────────────────────────────────────────────────────────────
 
 def find_quality_for_target_size(img, save_fmt, base_kw, target_bytes):
@@ -336,13 +497,17 @@ def find_quality_for_target_size(img, save_fmt, base_kw, target_bytes):
 def convert_one(path, out_dir, fmt, out_name, quality,
                 mode, target_w, target_h, current_config_str, resize_key=None,
                 quality_mode="percent", target_bytes=None,
-                cache=None, lock=None):
+                keep_metadata=False, cache=None, lock=None):
     """Конвертирует один файл. Вызывается из пула потоков.
 
     cache/lock - необязательные общий словарь и блокировка, которыми
     владеет вызывающий код (обычно главное окно приложения). Если cache
     не передан, кэширование результатов просто отключается - функцию
     можно вызывать и полностью автономно.
+
+    keep_metadata=True（选项「保留元数据」）——把源文件内嵌元数据
+    （EXIF / XMP / ICC / PNG 文本块 / JPEG 注释）复制到结果文件，
+    并且不再把颜色强制转到 sRGB，而是保留源 ICC 配置。
     """
     out_path  = os.path.join(out_dir, out_name)
     error_msg = None
@@ -371,7 +536,8 @@ def convert_one(path, out_dir, fmt, out_name, quality,
     size_str = "0 KB"
     try:
         # ── SVG: рендерим через resvg_py в PNG-байты, затем открываем как обычное изображение
-        is_svg = os.path.splitext(path)[1].lower() == ".svg"
+        is_svg   = os.path.splitext(path)[1].lower() == ".svg"
+        src_meta = None  # 快照源元数据（SVG 是矢量渲染，没有源元数据可搬）
         if is_svg and SVG_AVAILABLE:
             # Читаем байты и определяем кодировку: поддерживаем UTF-16 и UTF-8 BOM
             with open(path, "rb") as _fb:
@@ -420,6 +586,11 @@ def convert_one(path, out_dir, fmt, out_name, quality,
         else:
             img = Image.open(path)
             img.load()  # полностью читаем чтобы можно было закрыть файл
+            # 元数据必须在这里抓快照：下面的 CMYK/ICC/resize 都会换掉 img 对象
+            if keep_metadata and not is_svg:
+                src_meta = extract_source_metadata(img, path)
+            else:
+                src_meta = None
 
         with img:
             if not is_svg:
@@ -429,9 +600,11 @@ def convert_one(path, out_dir, fmt, out_name, quality,
             if img.mode == "CMYK":
                 img = img.convert("RGB")
 
+            # 勾选「保留元数据」且源图带 ICC 时保留源色彩配置，不再强制转 sRGB
+            keep_src_icc = bool(keep_metadata and src_meta and src_meta.get("icc"))
             try:
                 icc_profile = img.info.get("icc_profile")
-                if icc_profile:
+                if icc_profile and not keep_src_icc:
                     src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_profile))
                     dst_profile = ImageCms.createProfile("sRGB")
                     # Сохраняем альфа если он есть
@@ -496,9 +669,17 @@ def convert_one(path, out_dir, fmt, out_name, quality,
                         img = img.convert("RGBA")
                     else:
                         img = img.convert("RGB")
-                # Встраиваем sRGB ICC-профиль - AVIF декодеры ожидают его явно
-                srgb_profile = ImageCms.createProfile("sRGB")
-                kw["icc_profile"] = ImageCms.ImageCmsProfile(srgb_profile).tobytes()
+                # Встраиваем sRGB ICC-профиль - AVIF декодеры ожидают его явно.
+                # 保留源 ICC 时不覆盖，交给下面的元数据参数写入源配置。
+                if not keep_src_icc:
+                    srgb_profile = ImageCms.createProfile("sRGB")
+                    kw["icc_profile"] = ImageCms.ImageCmsProfile(srgb_profile).tobytes()
+
+            # 元数据参数放在最后拼装：此时 img.size 已是最终尺寸，
+            # EXIF 里的像素尺寸/缩略图才能按结果修正。
+            meta_kw = build_metadata_kwargs(fmt, src_meta, img.size) if src_meta else {}
+            if meta_kw:
+                kw.update(meta_kw)
 
             tmp_path = out_path + ".tmp"
             save_fmt = "HEIF" if fmt == "HEIC" else fmt
@@ -509,7 +690,15 @@ def convert_one(path, out_dir, fmt, out_name, quality,
                 kw["quality"] = quality
 
             try:
-                img.save(tmp_path, save_fmt, **kw)
+                try:
+                    img.save(tmp_path, save_fmt, **kw)
+                except Exception:
+                    # 元数据写不进去（某些格式拒绝这段 EXIF/XMP）时不能拖垮
+                    # 整个转换：剥掉元数据再存一次，功能降级而非失败。
+                    if not meta_kw:
+                        raise
+                    kw = {k: v for k, v in kw.items() if k not in meta_kw}
+                    img.save(tmp_path, save_fmt, **kw)
                 if os.path.exists(out_path):
                     os.remove(out_path)
                 os.replace(tmp_path, out_path)
